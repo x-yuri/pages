@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+    <link rel="stylesheet" type="text/css" href="mailing-list.css">
+</head>
+<body>
+
+<table class="conversation">
+{#messages}
+<tr id="id_{@idx}{.}{/idx}">
+    <td class="user">
+        {user}
+        <br>
+        {#url}<a class="timestamp" href="{url}">{:else}<span class="timestamp">{/url}{timestamp}{#url}</a>{:else}</span>{/url}
+    <td class="message">
+        {#ps}
+            {.|textile|s}
+        {/ps}
+{/messages}
+</table>
+
+</body>
+</html>
