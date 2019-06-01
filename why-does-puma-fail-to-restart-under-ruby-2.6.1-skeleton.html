@@ -1,0 +1,345 @@
+<!doctype html><html><head><title>puma fails to restart under ruby-2.6.1. - Why doesn't it work?</title><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/skeleton/2.0.4/skeleton.min.css"><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.15.6/styles/default.min.css"><style>body {max-width: 50em;margin: 50px auto;}.page-content {padding: 0 50px;}a.hljs-comment {color: #1EAEDB;}a.hljs-comment:hover {color: #0FA0CE;}</style></head><body><div class="page-content"><h1 id="span-stylecolor-graywhy-doesnt-it-workspanbrpuma-fails-to-restart-under-ruby-261"><span style="color: gray;">Why doesn&#39;t it work?</span><br><code>puma</code> fails to restart under <code>ruby-2.6.1</code>.</h1>
+<p>One of these days I&#39;ve stumbled upon an issue, that can be reproduced like so:</p>
+<p><code>Gemfile</code>:</p>
+<pre><code class="language-rb"><html><head></head><body>gem <span class="hljs-string">'puma'</span></body></html></code></pre>
+<p><code>1.ru</code>:</p>
+<pre><code class="language-rb"><html><head></head><body>run lambda { <span class="hljs-params">|env|</span> [<span class="hljs-number">200</span>, {<span class="hljs-string">"Content-Type"</span> =&gt; <span class="hljs-string">"text/plain"</span>}, [<span class="hljs-string">"Hello World"</span>]] }</body></html></code></pre>
+<pre><code>$ ruby --version
+ruby 2.6.1p33 (2019-01-30 revision 66950) [x86_64-linux]
+
+$ gem list -ae bundler
+*** LOCAL GEMS ***
+bundler (2.0.1, default: 1.17.2)
+
+$ bundle
+$ bundle exec puma --version
+puma version 3.12.0
+
+$ bundle exec puma 1.ru &amp;
+[1] 1581
+Puma starting in single mode...
+* Version 3.12.0 (ruby 2.6.1-p33), codename: Llamas in Pajamas
+* Min threads: 0, max threads: 16
+* Environment: development
+* Listening on tcp://0.0.0.0:9292
+Use Ctrl-C to stop
+
+$ kill -USR2 %1
+* Restarting...
+You must use Bundler 2 or greater with this lockfile.
+[1]+  Exit 20                 bundle exec puma 1.ru</code></pre><p>The message can be found in <a href="https://github.com/bundler/bundler/blob/v2.0.1/lib/bundler/lockfile_parser.rb#L108"><code>bundler/lockfile_parser.rb</code></a>. And it&#39;s
+produced by <code>bundler-2.x</code>.</p>
+<p>But let&#39;s take a step aside and talk about how ruby chooses which gem version
+to use.</p>
+<h3 id="how-does-ruby-resolve-files">How does <code>ruby</code> resolve files?</h3>
+<p>Let me quote <a href="https://ruby-doc.org/core-2.6.1/Kernel.html#method-i-require">the documentation</a> here:</p>
+<blockquote>
+<p>If the filename does not resolve to an absolute path, it will be searched for
+in the directories listed in $LOAD_PATH ($:).</p>
+</blockquote>
+<p>Things are getting a little more involved when <a href="https://github.com/rubygems/rubygems/blob/v3.0.1/lib/rubygems/core_ext/kernel_require.rb#L24-L29">gems</a> enter the scene:</p>
+<blockquote>
+<p>When you call require &#39;x&#39;, this is what happens:</p>
+<ul>
+<li>If the file can be loaded from the existing Ruby loadpath, it is.</li>
+<li>Otherwise, installed gems are searched for a file that matches. If it&#39;s
+found in gem &#39;y&#39;, that gem is activated (added to the loadpath).</li>
+</ul>
+</blockquote>
+<p>In other words, <code>rubygems</code> implementation of <a href="https://github.com/rubygems/rubygems/blob/v3.0.1/lib/rubygems/core_ext/kernel_require.rb#L34-L133"><code>require</code> method</a> goes
+along the lines of:</p>
+<pre><code class="language-rb"><html><head></head><body><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">require</span><span class="hljs-params">(path)</span></span>
+  <span class="hljs-keyword">return</span> original_require(path)
+<span class="hljs-keyword">rescue</span> LoadError
+  find_gem_by_path(path).activate
+  <span class="hljs-keyword">return</span> original_require(path)
+<span class="hljs-keyword">end</span></body></html></code></pre>
+<p>But there are possibly multiple gems (multiple versions of gems) that has
+the requested file. In such case <code>ruby</code> chooses the <a href="https://github.com/rubygems/rubygems/blob/v3.0.1/lib/rubygems/core_ext/kernel_gem.rb#L20-L21">latest version</a>
+of the gem:</p>
+<blockquote>
+<p>If you will be activating the latest version of a gem, there is no need to
+call Kernel#gem, Kernel#require will do the right thing for you.</p>
+</blockquote>
+<p>Or more precisely, the latest version of the <a href="https://github.com/rubygems/rubygems/blob/v3.0.1/lib/rubygems/specification.rb#L856-L862">alphabetically first</a> gem
+that has the file.
+You can try and put the following file to the <code>lib</code> dir of two different gems:</p>
+<p><code>1.rb</code>:</p>
+<pre><code class="language-rb"><html><head></head><body>puts __FILE_<span class="hljs-number">_</span></body></html></code></pre>
+<p>Then <code>ruby -r1 -e &#39;&#39;</code> (or <code>ruby -e &#39;require &quot;1&quot;&#39;</code>) will give you the path to the
+one that comes first alphabetically.</p>
+<p>At this point it must be clear that getting the error above from <code>bundler-2.x</code>
+is nothing unusual. What is a mystery is why <code>bundler-2.x</code> complains about
+not using <code>bundler-2.x</code>.</p>
+<p>To understand that we&#39;ve got to know what are default gems. Since, as you might
+have
+seen from the <code>gem list</code> output above, <code>bundler</code> is now a <a href="https://stdgems.org/compare/">default gem</a>.</p>
+<p>So, there are <a href="https://stdgems.org/">two types of gems</a>
+that come with <code>ruby</code>: bundled and default.
+Bundled are not much different from those you install yourself, save you
+don&#39;t need to install them. Unless you want a newer version. In other words, bundled
+gems are basically preinstalled gems.</p>
+<p>Default gems are much more tightly incorporated into the language. They are
+like bundled gems, but with some extra particularities.
+Default gems are maintained by language developers.
+Their files (the ones that are normally located in gem&#39;s <code>lib</code> dir)
+reside in the standard library dir
+(<code>~/.rubies/ruby-&lt;version&gt;/lib/ruby/&lt;version&gt;</code>).
+Not in a separate dir like with bundled
+(<code>~/.rubies/ruby-&lt;version&gt;/lib/ruby/gems/&lt;version&gt;/gems</code>),
+or installed gems
+(<code>~/.gems/ruby/&lt;version&gt;/gems</code>).
+And you can&#39;t delete them, as opposed to the other types of gems.</p>
+<p>But if they are part of the standard library, installing a newer version won&#39;t
+have any effect, right?
+Since the first <code>original_require()</code> would succeed for any file that belongs to
+a default gem.
+Not really, for that there&#39;s an extra twist in <code>require</code> method:</p>
+<pre><code class="language-rb"><html><head></head><body><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">require</span><span class="hljs-params">(path)</span></span>
+  <span class="hljs-keyword">if</span> gem = find_default_gem_by_path(path)
+    gem.activate
+  <span class="hljs-keyword">end</span>
+  <span class="hljs-keyword">return</span> original_require(path)
+<span class="hljs-keyword">rescue</span> LoadError
+  find_gem_by_path(path).activate
+  <span class="hljs-keyword">return</span> original_require(path)
+<span class="hljs-keyword">end</span></body></html></code></pre>
+<p>So, before the first <code>original_require()</code> it checks whether there&#39;s a default gem
+that provides the file to be required. If so, it finds the latest
+version available of the gem and activates it.</p>
+<p>Actually even if there were no special handling of default gems, you could make
+use of their newer versions, but in a more involved way:</p>
+<pre><code>$ ruby -e &#39;require &quot;bundler/version&quot;; puts Bundler::VERSION&#39;                                       
+1.17.2
+
+$ ruby -e &#39;gem &quot;bundler&quot;, &quot;~&gt; 2.0&quot;; require &quot;bundler/version&quot;; puts Bundler::VERSION&#39;              
+2.0.1</code></pre><p>Does that ring a bell? That&#39;s the syntax from <code>Gemfile</code>. You can use it
+outside of <code>Gemfile</code>, like <a href="https://github.com/rails/rails/blob/v5.2.3/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb#L4">others</a> sometimes do.</p>
+<p>The other thing that you might have noticed is that
+by default the chosen version was <code>1.17.2</code>,
+not <code>2.0.1</code>. And that is a <a href="https://bugs.ruby-lang.org/issues/15582">known bug</a> (fixed in <code>ruby-2.6.2</code>).
+For one reason or another, specification of the default gem <code>bundler-1.17.2</code>
+(at <code>~/.rubies/ruby-&lt;version&gt;/lib/ruby/gems/&lt;version&gt;/specifications/default</code>)
+states that <code>bundler</code> gem is composed of only <code>bundler.rb</code>, <code>exe/bundle</code> and
+<code>exe/bundler</code>. And it&#39;s the specification that <code>ruby</code> uses to check if
+a default gem contains the file to be required.</p>
+<p>You can compare it to <code>rdoc</code>:</p>
+<pre><code>$ gem list -ea rdoc
+*** LOCAL GEMS ***
+rdoc (6.1.1, default: 6.1.0, 4.3.0, 4.2.0)
+
+$ ruby -e &#39;require &quot;rdoc/version&quot;; puts RDoc::VERSION&#39;
+6.1.1
+
+$ ruby -e &#39;gem &quot;rdoc&quot;, &quot;6.1.0&quot;; require &quot;rdoc/version&quot;; puts RDoc::VERSION&#39;
+6.1.0</code></pre><p>But if just 3 files are considered to be part of the gem, can you picture what
+might happen when <code>bundler</code> is required? Meaning, 
+at some point it will inevitably stumble upon <code>bundler.rb</code>. What happens next?</p>
+<pre><code>$ touch Gemfile &amp;&amp; ruby -rbundler/setup -e &#39;&#39;
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/gem_helpers.rb:5: warning: already initialized constant Bundler::GemHelpers::GENERIC_CACHE
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/gem_helpers.rb:5: warning: previous definition of GENERIC_CACHE was here
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/gem_helpers.rb:6: warning: already initialized constant Bundler::GemHelpers::GENERICS
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/gem_helpers.rb:6: warning: previous definition of GENERICS was here
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/gem_helpers.rb:52: warning: already initialized constant Bundler::GemHelpers::PlatformMatch
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/gem_helpers.rb:52: warning: previous definition of PlatformMatch was here
+Traceback (most recent call last):
+        9: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/rubygems/core_ext/kernel_require.rb:54:in `require&#39;
+        8: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/rubygems/core_ext/kernel_require.rb:54:in `require&#39;
+        7: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/setup.rb:10:in `&lt;top (required)&gt;&#39;
+        6: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler.rb:107:in `setup&#39;
+        5: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb:26:in `setup&#39;
+        4: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb:26:in `map&#39;
+        3: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/spec_set.rb:148:in `each&#39;
+        2: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/spec_set.rb:148:in `each&#39;
+        1: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb:31:in `block in setup&#39;
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb:319:in `check_for_activated_spec!&#39;: You have already activated bundler 2.0.1, but your Gemfile requires bundler 1.17.2. Prepending `bundle exec` to your command may solve this. (Gem::LoadError)</code></pre><p>Here you are, at <a href="https://github.com/bundler/bundler/blob/v1.17.2/lib/bundler/setup.rb#L10">line 10</a> of <code>bundler/setup</code> from <code>bundler-1.x</code>
+<code>ruby</code> switched to
+<code>bundler-2.x</code>. Or rather a couple of lines earlier, when requiring <code>bundler</code>.
+We can confirm that by adding the following line before <a href="https://github.com/bundler/bundler/blob/v2.0.1/lib/bundler/runtime.rb#L319">raising
+the exception</a>:</p>
+<pre><code class="language-rb"><html><head></head><body>$LOADED_FEATURES.grep(<span class="hljs-regexp">/bundler/</span>).each { <span class="hljs-params">|f|</span> puts f }</body></html></code></pre>
+<pre><code>$ ruby -rbundler/setup -e &#39;&#39;
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/version.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/compatibility_guard.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/constants.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/rubygems_integration.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/current_ruby.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/shared_helpers.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/fileutils/lib/fileutils.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendored_fileutils.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/errors.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/environment_preserver.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/plugin/api.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/plugin.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/gem_helpers.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/match_platform.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/rubygems_ext.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/build_metadata.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/settings.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/feature_flag.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/source.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/source/path.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/source/git.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/source/rubygems.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/lockfile_parser.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/definition.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/dependency.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/ruby_dsl.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/dsl.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/source_list.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/source/metadata.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/spec_set.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/compatibility.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/gem_metadata.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/delegates/specification_provider.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/errors.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/action.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/add_edge_no_circular.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/add_vertex.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/delete_edge.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/detach_vertex_named.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/set_payload.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/tag.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/log.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph/vertex.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/dependency_graph.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/state.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/modules/specification_provider.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/delegates/resolution_state.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/resolution.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/resolver.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo/modules/ui.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendor/molinillo/lib/molinillo.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/vendored_molinillo.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/resolver/spec_group.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/resolver.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/index.rb
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/ui.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/ui/silent.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/ui/rg_proxy.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/ruby_version.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/dep_proxy.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/remote_specification.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/stub_specification.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/gem_version_promoter.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/gem_helpers.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/match_platform.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/lazy_specification.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/endpoint_specification.rb
+/home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/source/gemspec.rb
+Traceback (most recent call last):
+        9: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/rubygems/core_ext/kernel_require.rb:54:in `require&#39;
+        8: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/rubygems/core_ext/kernel_require.rb:54:in `require&#39;
+        7: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/setup.rb:10:in `&lt;top (required)&gt;&#39;
+        6: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler.rb:107:in `setup&#39;
+        5: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb:26:in `setup&#39;
+        4: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb:26:in `map&#39;
+        3: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/spec_set.rb:148:in `each&#39;
+        2: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/spec_set.rb:148:in `each&#39;
+        1: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb:31:in `block in setup&#39;
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/runtime.rb:321:in `check_for_activated_spec!&#39;: You have already activated bundler 2.0.1, but your Gemfile requires bundler 1.17.2. Prepending `bundle exec` to your command may solve this. (Gem::LoadError)</code></pre><p>It turns out there&#39;s a bit more to it than that. At some point <code>bundler</code> 
+<a href="https://github.com/bundler/bundler/blob/v2.0.1/lib/bundler/runtime.rb#L18">cleans the load path</a> for some reason. Which switches it back
+to <code>bundler-1.x</code>.</p>
+<p>Anyways, now one can probably understand why it said that <code>bundler-2.0.1</code> was already activated.
+That happened the moment it did <code>require &#39;bundler&#39;</code>. Since that is one of the
+few files that are in the spec.</p>
+<p>But what is that thing about <code>Gemfile</code>, that requires <code>bundler-1.17.2</code>? Where
+did
+that come from? Well, at some point <code>bundler</code> realizes that it&#39;s not in the
+list of
+the dependencies, therefore it <a href="https://github.com/bundler/bundler/blob/v2.0.1/lib/bundler/definition.rb#L180-L183">adds</a> itself. But since <code>bundler/version</code> has
+resolved
+to
+that of <code>bundler-1.17.2</code>, it adds <code>bundler-1.17.2</code>, not <code>bundler-2.0.1</code>.
+Hence the message.</p>
+<p>But that doesn&#39;t happen when <code>Gemfile.lock</code> exists (after running <code>bundle</code>).
+So let&#39;s cut <code>bundler</code> some
+slack, and pretend that it&#39;s okay.</p>
+<pre><code>$ bundler
+$ ruby -rbundler/setup -e &#39;&#39;
+You must use Bundler 2 or greater with this lockfile.</code></pre><p>And now we get the message as <a href="https://github.com/bundler/bundler/blob/v2.0.1/lib/bundler/lockfile_parser.rb#L108">in the beginning</a>. Here it compares
+<code>Bundler::VERSION</code> (which comes from <code>bundler-1.x</code>, see <code>$LOADED_FEATURES</code>) with
+the version from <code>Gemfile.lock</code> (<code>BUNDLED WITH</code> clause). That is, <code>bundler-2.x</code>
+thinks that it&#39;s <code>bundler-1.x</code> and complains about using <code>bundler</code> version,
+that is incompatible with the <code>Gemfile.lock</code>.</p>
+<p>This <code>BUNDLED WITH</code> clause explains why <code>bundler</code> added itself as a
+dependency in the previous case, where <code>Gemfile.lock</code> didn&#39;t exist.
+<code>BUNDLED WITH</code>
+is basically an implicit <code>gem &#39;bundler&#39;, &#39;=&gt; x&#39;, &#39;&lt; x + 1&#39;</code>, where <code>x</code> is a major
+version of <code>bundler</code> that generated the lock file.</p>
+<p>You might as well run into another variation of the message:</p>
+<pre><code>$ ruby -rbundler/setup -e &#39;&#39; | cat
+Traceback (most recent call last):
+        12: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/rubygems/core_ext/kernel_require.rb:54:in `require&#39;
+        11: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/rubygems/core_ext/kernel_require.rb:54:in `require&#39;
+        10: from /home/yuri/.rubies/ruby-2.6.1/lib/ruby/2.6.0/bundler/setup.rb:20:in `&lt;top (required)&gt;&#39;
+         9: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler.rb:101:in `setup&#39;
+         8: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler.rb:135:in `definition&#39;
+         7: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/definition.rb:34:in `build&#39;
+         6: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/dsl.rb:13:in `evaluate&#39;
+         5: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/dsl.rb:234:in `to_definition&#39;
+         4: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/dsl.rb:234:in `new&#39;
+         3: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/definition.rb:83:in `initialize&#39;
+         2: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/definition.rb:83:in `new&#39;
+         1: from /home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/lockfile_parser.rb:95:in `initialize&#39;
+/home/yuri/.gem/ruby/2.6.1/gems/bundler-2.0.1/lib/bundler/lockfile_parser.rb:108:in `warn_for_outdated_bundler_version&#39;: You must use Bundler 2 or greater with this lockfile. (Bundler::LockfileError)</code></pre><p>When <code>stdout</code> is not a tty, <code>bundler</code> doesn&#39;t <a href="https://github.com/bundler/bundler/blob/v1.17.2/lib/bundler/setup.rb#L8-L21">bother</a> itself with
+prettifying the error.</p>
+<p>But with all this switching back and forth, it seems to work sometimes.
+At least the <code>bundle</code> command above have succeeded.
+And that is because binstubs basically go like <a href="https://github.com/rubygems/rubygems/blob/v3.0.1/lib/rubygems/installer.rb#L762">this</a>:</p>
+<pre><code class="language-rb"><html><head></head><body>find_gem_by_path(path).activate
+load path</body></html></code></pre>
+<p>In this case <code>path</code> (<code>== &#39;bundler&#39;</code>) is listed in the specification, as such the gem gets
+activated
+right away (before requiring the first file). Not in the middle like before.</p>
+<p>Also, that explains why it generated <code>Gemfile.lock</code> with <code>BUNDLED WITH 2.0.1</code>.</p>
+<p>And the last piece of the puzzle needed to understand what makes <code>puma</code> crash is...</p>
+<h3 id="how-does-bundler-persist-across-processes">How does <code>bundler</code> persist across processes?</h3>
+<p>Consider the following scripts:</p>
+<p><code>1.rb</code>:</p>
+<pre><code class="language-rb"><html><head></head><body>puts <span class="hljs-string">"<span class="hljs-subst">#{$0}</span>: <span class="hljs-subst">#{Bundler::VERSION}</span>"</span>
+puts <span class="hljs-string">`ruby 2.rb`</span></body></html></code></pre>
+<p><code>2.rb</code>:</p>
+<pre><code class="language-rb"><html><head></head><body>puts <span class="hljs-string">"<span class="hljs-subst">#{$0}</span>: <span class="hljs-subst">#{Bundler::VERSION}</span>"</span></body></html></code></pre>
+<p>Then:</p>
+<pre><code>$ touch Gemfile &amp;&amp; bundle exec ruby 1.rb
+1.rb: 2.0.1
+2.rb: 2.0.1</code></pre><p>To tell you the truth, by default <code>bundler exec</code> cheats and <a href="https://github.com/bundler/bundler/blob/v2.0.1/lib/bundler/cli/exec.rb#L28">doesn&#39;t fork</a>.
+But that makes not much difference here.
+The answer lies in <code>RUBYOPT</code> and <code>RUBYLIB</code> environment
+variables. Let me quote <a href="https://ruby-doc.com/docs/ProgrammingRuby/html/rubyworld.html#S3">the Pick-axe Book</a>:</p>
+<blockquote>
+<p>RUBYOPT Additional command-line options to Ruby; examined after real command-line options are parsed ($SAFE must be 0).</p>
+<p>RUBYLIB Additional search path for Ruby programs ($SAFE must be 0).</p>
+</blockquote>
+<p><code>bundler</code> adds <code>-rbundler/setup</code> to <a href="https://github.com/bundler/bundler/blob/v2.0.1/lib/bundler/shared_helpers.rb#L336"><code>RUBYOPT</code></a>, which makes the child
+require
+<code>bundler/setup</code> before executing the script. And adds <code>bundler</code>&#39;s <code>lib</code> dir to
+<a href="https://github.com/bundler/bundler/blob/v2.0.1/lib/bundler/shared_helpers.rb#L343"><code>RUBYLIB</code></a>, which is equivalent to adding the dir to <code>$LOAD_PATH</code> or
+activating the gem.</p>
+<p>What that out of the way...</p>
+<h3 id="so-what-makes-puma-crash-in-the-end">So, what makes <code>puma</code> crash in the end?</h3>
+<p>Here&#39;s a simplified version of <code>puma</code>&#39;s <a href="https://github.com/puma/puma/blob/v3.12.0/lib/puma/launcher.rb#L166-L199"><code>run</code> method</a>:</p>
+<pre><code class="language-rb"><html><head></head><body><span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Puma::Launcher</span></span>
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">run</span>   <span class="hljs-comment"># source</span></span>
+        previous_env = Bundler::ORIGINAL_ENV
+        previous_env[<span class="hljs-string">'RUBYOPT'</span>] = <span class="hljs-string">'-rbundler/setup '</span> + previous_env[<span class="hljs-string">'RUBYOPT'</span>]
+        @runner.run   <span class="hljs-comment"># returns when puma receives restart signal</span>
+        <span class="hljs-keyword">case</span> @status
+        <span class="hljs-keyword">when</span> <span class="hljs-symbol">:restart</span>
+            ENV.replace(previous_env)
+            restart!
+        ...
+        <span class="hljs-keyword">end</span>
+    <span class="hljs-keyword">end</span>
+<span class="hljs-keyword">end</span></body></html></code></pre>
+<p><code>Bundler::ORIGINAL_ENV</code> is, as one might guess, the environment without changes
+made
+by <code>bundler</code>. So, basically before restart <code>puma</code> undoes changes made to
+<code>RUBYLIB</code>
+variable. The child requires <code>bundler-1.x</code>. In the middle of it it switches to
+<code>bundler-2.x</code>. But it still thinks it&#39;s <code>bundler-1.x</code>. Which makes it complain
+about using incompatible <code>bundler</code> version.</p>
+</div><script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/marked/0.6.1/marked.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.15.6/highlight.min.js"></script></body></html>
